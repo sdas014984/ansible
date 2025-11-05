@@ -12,11 +12,13 @@
 
     - name: Print EC2 info in tabular format
       debug:
+            - name: Print EC2 info in clean table format
+      debug:
         msg: |
-          {{ '%-20s %-15s %-12s %-12s %-15s' | format('Name','InstanceId','State','Type','PublicIP') }}
-          {{ '-' * 80 }}
+          {{ '%-20s %-20s %-12s %-12s %-15s' | format('Name','InstanceId','State','Type','PublicIP') }}
+          {{ '-' * 90 }}
           {% for i in ec2_info.instances %}
-          {{ '%-20s %-15s %-12s %-12s %-15s' | format(
+          {{ '%-20s %-20s %-12s %-12s %-15s' | format(
               i.tags.Name | default('N/A'),
               i.instance_id,
               i.state.name,
