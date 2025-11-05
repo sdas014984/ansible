@@ -1,0 +1,26 @@
+- name: Print EC2 instance info in tabular format
+  hosts: localhost
+  gather_facts: no
+  vars:
+    region: us-east-1
+
+  tasks:
+    - name: Get EC2 instance info
+      amazon.aws.ec2_instance_info:
+        region: "{{ region }}"
+      register: ec2_info
+
+    - name: Print EC2 info in tabular format
+      debug:
+        msg: |
+          {{ '%-20s %-15s %-12s %-12s %-15s' | format('Name','InstanceId','State','Type','PublicIP') }}
+          {{ '-' * 80 }}
+          {% for i in ec2_info.instances %}
+          {{ '%-20s %-15s %-12s %-12s %-15s' | format(
+              i.tags.Name | default('N/A'),
+              i.instance_id,
+              i.state.name,
+              i.instance_type,
+              i.public_ip_address | default('N/A')
+          ) }}
+          {% endfor %}
