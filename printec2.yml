@@ -1,0 +1,19 @@
+---
+- name: Get all information about an EC2 instance
+  hosts: localhost
+  gather_facts: no
+  vars:
+    instance_id: i-06281043645f396e8   # Replace with your EC2 instance ID
+    region: us-east-1                 # Replace with your AWS region
+
+  tasks:
+    - name: Get EC2 instance information
+      amazon.aws.ec2_instance_info:
+        region: "{{ region }}"
+        instance_ids:
+          - "{{ instance_id }}"
+      register: ec2_info
+
+    - name: Print the entire EC2 information
+      debug:
+        var: ec2_info
