@@ -1,0 +1,6 @@
+- name: Installing packages
+  yum: name={{ item }} state=present
+  with_items:
+    - git
+    - tree
+

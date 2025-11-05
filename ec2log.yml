@@ -1,0 +1,48 @@
+- name: Safe EC2 creation with cleanup on failure
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - block:
+        - name: Launch EC2 instance
+          amazon.aws.ec2_instance:
+            name: demo-instance
+            key_name: suv-key-pair
+            instance_type: t3.micro
+            image_id: ami-0bdd88bd06d16ba03
+            region: us-east-1
+            wait: yes
+          register: ec2_info
+
+        - name: Do something else
+          command: /bin/false  # simulate failure
+
+        - name: Save logs
+          copy:
+            content: "{{ ec2_info | to_nice_json }}"
+            dest: "./logs/ec2_{{ ansible_date_time.date }}_{{ ansible_date_time.time }}.json"
+
+
+      rescue:
+        - name: Clean up EC2 if something failed
+          amazon.aws.ec2_instance:
+            instance_ids: "{{ ec2_info.instances[0].instance_id }}"
+            region: us-east-1
+            state: absent
+          register: cleanup
+
+        - name: Confirm cleanup
+          debug:
+            msg: "Cleanup completed for {{ ec2_info.instances[0].instance_id }} — State: {{ cleanup.changed | ternary('terminated', 'no action taken') }}"
+
+#      rescue:
+#        - name: Clean up EC2 if something failed
+#          amazon.aws.ec2_instance:
+#            instance_ids: "{{ ec2_info.instances[0].instance_id }}"
+#            region: us-east-1
+#            state: absent
+
+        - name: Notify cleanup
+          debug:
+            msg: "An error occurred. Instance {{ ec2_info.instances[0].instance_id }} has been terminated."
+

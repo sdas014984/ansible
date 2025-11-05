@@ -1,0 +1,73 @@
+---
+- name: Deploy EC2 instance and install Nginx
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    aws_region: us-east-1
+    key_name: my-ec2-keypair
+    instance_type: t2.micro
+    ami_id: ami-0abcdef1234567890 # Replace with a valid AMI ID for your region and OS
+    security_group_name: web-ssh-sg
+    instance_tags:
+      Name: Ansible-Nginx-Server
+      Environment: Development
+
+  tasks:
+    - name: Ensure security group exists and allows SSH and HTTP
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: "Allow SSH and HTTP traffic"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Name: "{{ security_group_name }}"
+      register: sg_result
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        region: "{{ aws_region }}"
+        security_group: "{{ security_group_name }}"
+        wait: yes
+        tags: "{{ instance_tags }}"
+      register: ec2_instance
+
+    - name: Add new instance to in-memory inventory
+      ansible.builtin.add_host:
+        hostname: "{{ ec2_instance.instances[0].public_ip }}"
+        groups: webservers
+        ansible_user: ec2-user # Or appropriate user for your AMI
+        ansible_ssh_private_key_file: "~/.ssh/{{ key_name }}.pem" # Path to your private key
+
+- name: Configure Nginx on the new instance
+  hosts: webservers
+  become: yes # Run tasks with sudo privileges
+  tasks:
+    - name: Install Nginx
+      ansible.builtin.apt: # Use 'yum' for RHEL-based systems
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Start Nginx service
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Deploy a simple Nginx index page
+      ansible.builtin.copy:
+        content: "<h1>Hello from Ansible on AWS!</h1>"
+        dest: /var/www/html/index.nginx-debian.html # Or /usr/share/nginx/html/index.html for RHEL-based
+        mode: '0644'

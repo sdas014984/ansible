@@ -1,0 +1,36 @@
+- hosts: web
+  become: yes
+  tasks:
+    - name: Install and start Apache
+      yum:
+        name: httpd
+        state: present
+    - service:
+        name: httpd
+        state: started
+        enabled: yes
+
+- hosts: app
+  become: yes
+  tasks:
+    - name: Install Tomcat
+      yum:
+        name: tomcat
+        state: present
+    - service:
+        name: tomcat
+        state: started
+        enabled: yes
+
+- hosts: db
+  become: yes
+  tasks:
+    - name: Install MariaDB
+      yum:
+        name: mariadb-server
+        state: present
+    - service:
+        name: mariadb
+        state: started
+        enabled: yes
+

@@ -1,0 +1,13 @@
+- hosts: all
+  tasks:
+    - name: installing apache
+      yum: name=httpd state=present
+
+    - name: start apache
+      service: name=httpd state=started
+
+    - name: checkout
+      git: 
+        repo: https://github.com/RAHAMSHAIK007/netflix-clone.git
+        dest: "/var/www/html/"
+

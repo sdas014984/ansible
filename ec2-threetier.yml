@@ -1,0 +1,136 @@
+- name: Provision 2-tier AWS architecture
+  hosts: localhost
+  gather_facts: no
+  vars:
+    region: us-east-1
+    keypair: suv-key-pair
+    image_id: ami-0bdd88bd06d16ba03
+    instance_type: t3.micro
+    security_group: default
+
+  tasks:
+    - name: Launch Web Server instance
+      amazon.aws.ec2_instance:
+        name: web-tier
+        key_name: "{{ keypair }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ image_id }}"
+        region: "{{ region }}"
+        wait: yes
+        security_groups: ["{{ security_group }}"]
+        tags:
+          Name: web-tier
+          Role: web
+      register: web_instance
+
+    - name: Launch Database Server instance
+      amazon.aws.ec2_instance:
+        name: db-tier
+        key_name: "{{ keypair }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ image_id }}"
+        region: "{{ region }}"
+        wait: yes
+        security_groups: ["{{ security_group }}"]
+        tags:
+          Name: db-tier
+          Role: database
+      register: db_instance
+
+    - name: Show IPs of both servers
+      debug:
+        msg:
+          - "Web Server Public IP: {{ web_instance.instances[0].public_ip_address }}"
+          - "DB Server Private IP: {{ db_instance.instances[0].private_ip_address }}"
+
+    - name: Add both instances to inventory dynamically
+      add_host:
+        name: webserver
+        ansible_host: "{{ web_instance.instances[0].public_ip_address }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: ~/.ssh/suv-key-pair.pem
+        group: web
+
+      when: web_instance is defined
+    - name: Add DB instance to inventory
+      add_host:
+        name: dbserver
+        ansible_host: "{{ db_instance.instances[0].private_ip_address }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: /root/.ssh/suv-key-pair.pem
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        group: db
+
+#    - name: Add DB instance to inventory
+#      add_host:
+#        name: dbserver
+#        ansible_host: "{{ db_instance.instances[0].private_ip_address }}"
+#        ansible_user: ec2-user
+#        ansible_ssh_private_key_file: ~/.ssh/id_rsa.pub
+#        group: db
+
+- name: Configure Web Tier
+  hosts: web
+  become: yes
+  tasks:
+    - name: Install NGINX
+      yum:
+        name: nginx
+        state: present
+
+    - name: Start NGINX
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Deploy simple HTML page showing DB IP
+      copy:
+        dest: /usr/share/nginx/html/index.html
+        content: |
+          <html>
+          <body style="font-family: sans-serif;">
+          <h1>Welcome to Web Tier</h1>
+          <p>Connected DB Server Private IP: {{ hostvars['dbserver']['ansible_host'] }}</p>
+          </body>
+          </html>
+
+          - name: Configure Database Tier
+  hosts: db
+  become: yes
+  tasks:
+    - name: Detect OS type
+      ansible.builtin.setup:
+        filter: ansible_distribution*
+      register: os_facts
+
+    - name: Install MariaDB or MySQL depending on OS
+      block:
+        - name: Install MariaDB (Amazon Linux 2 or RHEL)
+          yum:
+            name: mariadb105-server
+            state: present
+          when: "'Amazon' in os_facts.ansible_facts.ansible_distribution or 'RedHat' in os_facts.ansible_facts.ansible_distribution"
+
+        - name: Install MySQL (Ubuntu/Debian)
+          apt:
+            name: mysql-server
+            update_cache: yes
+            state: present
+          when: "'Ubuntu' in os_facts.ansible_facts.ansible_distribution or 'Debian' in os_facts.ansible_facts.ansible_distribution"
+
+    - name: Start database service (handles both)
+      ansible.builtin.service:
+        name: "{{ 'mysql' if 'Ubuntu' in os_facts.ansible_facts.ansible_distribution else 'mariadb' }}"
+        state: started
+        enabled: yes
+
+    - name: Confirm DB installation
+      ansible.builtin.shell: mysql --version || mariadb --version
+      register: db_version
+      changed_when: false
+
+    - debug:
+        msg: "Database installed successfully: {{ db_version.stdout }}"
+
+

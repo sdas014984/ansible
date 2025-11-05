@@ -1,0 +1,22 @@
+- name: Create EC2
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Launch instance
+      amazon.aws.ec2_instance:
+        name: demo-instance
+        key_name: suv-key-pair
+        instance_type: t3.micro
+        image_id: ami-0bdd88bd06d16ba03
+        region: us-east-1
+        wait: yes
+      register: ec2_info
+
+    - debug:
+        msg: "Created instance ID: {{ ec2_info.instances[0].instance_id }}"
+
+    - name: Save instance details
+      copy:
+        content: "{{ ec2_info | to_nice_json }}"
+        dest: ./ec2_details.json
+

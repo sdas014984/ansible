@@ -1,0 +1,223 @@
+---
+- name: Three-tier (AWS) — create web & app EC2s and configure them (DB already running on EC2)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    region: us-east-1                    # change as needed
+    instance_type_web: t3.micro
+    instance_type_app: t3.micro
+    key_name: ""                          # pass via --extra-vars
+    db_private_ip: ""                     # pass via --extra-vars (existing DB EC2 private IP)
+    ssh_user: ec2-user
+    aws_tags:
+      Project: three-tier
+      Owner: "{{ lookup('env','USER') | default('ansible') }}"
+
+  tasks:
+    - name: Fail early if key_name or db_private_ip not provided
+      fail:
+        msg: "You must pass key_name and db_private_ip via --extra-vars"
+      when: key_name == "" or db_private_ip == ""
+
+    - name: Find latest Amazon Linux 2 AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ region }}"
+        owners: ["amazon"]
+        filters:
+          name: "amzn2-ami-hvm-*-x86_64-gp2"
+          state: "available"
+      register: ami_info
+
+    - name: Select most recent AMI id
+      set_fact:
+        ami_id: "{{ (ami_info.images | sort(attribute='creation_date'))[-1].image_id }}"
+
+    - name: Create security group for web
+      amazon.aws.ec2_group:
+        name: three-tier-web-sg
+        description: Security group for web tier (http)
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+        tags: "{{ aws_tags }}"
+      register: web_sg
+
+    - name: Create security group for app
+      amazon.aws.ec2_group:
+        name: three-tier-app-sg
+        description: Security group for app tier (tomcat)
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            # Source will be the web SG. We'll allow web SG by id after we have it.
+            cidr_ip: web_sg
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+
+        tags: "{{ aws_tags }}"
+      register: app_sg
+
+    - name: Authorize app SG from web SG (replace temporary 127.0.0.1 rule)
+      amazon.aws.ec2_group:
+        name: three-tier-app-sg
+        description: Security group for app tier (tomcat) updated to allow web SG
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            group_id: "{{ web_sg.group_id }}"
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            group_id: "{{ web_sg.group_id }}"
+
+        state: present
+
+    - name: (Optional) Ensure DB SG allows app SG (best-effort)
+      debug:
+        msg: >
+          If you want security-group level allow from app -> DB, add the app SG id
+          ({{ app_sg.group_id }}) to your DB instance security group manually or provide the DB SG id.
+      when: db_private_ip is defined
+
+    - name: Launch web EC2 instance
+      amazon.aws.ec2_instance:
+        name: three-tier-web
+        region: "{{ region }}"
+        instance_type: "{{ instance_type_web }}"
+        key_name: "{{ key_name }}"
+        image_id: "{{ ami_id }}"
+        security_groups: [ "{{ web_sg.group_name }}" ]
+        wait: true
+        tags: "{{ aws_tags }}"
+      register: web_instance
+
+    - name: Launch app EC2 instance
+      amazon.aws.ec2_instance:
+        name: three-tier-app
+        region: "{{ region }}"
+        instance_type: "{{ instance_type_app }}"
+        key_name: "{{ key_name }}"
+        image_id: "{{ ami_id }}"
+        security_groups: [ "{{ app_sg.group_name }}" ]
+        wait: true
+        tags: "{{ aws_tags }}"
+      register: app_instance
+
+    - name: Add web host to in-memory inventory
+      add_host:
+        name: "{{ web_instance.instances[0].public_ip_address }}"
+        groups: dynamic_web
+        ansible_user: ec2-user
+        ansible_private_key_file: "/root/.ssh/suv-key-pair.pem"
+        ansible_host: "{{ web_instance.instances[0].public_ip_address }}"
+
+    - name: Add app host to in-memory inventory
+      add_host:
+        name: "{{ app_instance.instances[0].public_ip_address }}"
+        groups: dynamic_app
+        ansible_user: ec2-user
+        ansible_private_key_file: "/root/.ssh/suv-key-pair.pem"
+        ansible_host: "{{ app_instance.instances[0].public_ip_address }}"
+
+- name: Configure web server (httpd)
+  hosts: dynamic_web
+  become: yes
+  vars:
+    ansible_ssh_private_key_file: "/root/.ssh/suv-key-pair.pem"
+  gather_facts: yes
+    vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Wait for SSH on web
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 600
+
+    - name: Install httpd
+      yum:
+        name: httpd
+        state: present
+
+    - name: Ensure httpd enabled & started
+      service:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Deploy simple index.html
+      copy:
+        dest: /var/www/html/index.html
+        content: |
+          <html>
+          <body>
+          <h1>Web Tier ({{ inventory_hostname }})</h1>
+          <p>App server: {{ hostvars['dynamic_app'] | default({}) }}</p>
+          </body>
+          </html>
+        owner: root
+        group: root
+        mode: '0644'
+
+- name: Configure app server (Tomcat)
+  hosts: dynamic_app
+  become: yes
+  gather_facts: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    tomcat_service_name: tomcat
+  tasks:
+    - name: Wait for SSH on app
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 600
+
+    - name: Install Java (OpenJDK)
+      yum:
+        name: java-11-amazon-corretto-headless
+        state: present
+      ignore_errors: yes
+
+    - name: Install tomcat (yum)
+      yum:
+        name: tomcat
+        state: present
+
+    - name: Ensure tomcat enabled & started
+      service:
+        name: "{{ tomcat_service_name }}"
+        state: started
+        enabled: yes
+
+    - name: Place a simple app properties file with DB IP
+      copy:
+        dest: /etc/myapp/db_connection.conf
+        content: |
+          DB_HOST={{ db_private_ip }}
+          DB_PORT=3306
+        owner: tomcat
+        group: tomcat
+        mode: '0644'
+      notify: restart tomcat
+
+  handlers:
+    - name: restart tomcat
+      service:
+        name: "{{ tomcat_service_name }}"
+        state: restarted
+

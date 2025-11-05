@@ -1,0 +1,16 @@
+- name: Terminate EC2
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Load instance info
+      include_vars:
+        file: ./ec2_details.json
+        name: ec2_data
+
+    - name: Terminate instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ ec2_data.instances[0].instance_id }}"
+        region: us-east-1
+        state: absent
+

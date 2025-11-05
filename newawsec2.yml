@@ -1,0 +1,346 @@
+---
+- name: Three-tier AWS infra + instances (control run)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    region: "us-east-1"                # override via --extra-vars
+    key_name: ""                       # REQUIRED (key pair name in AWS)
+    create_db: false                   # if true, playbook will create a DB EC2
+    db_instance_type: t3.micro
+    app_instance_type: t3.micro
+    web_instance_type: t3.micro
+    instance_ami_filters:
+      owners: ["amazon"]
+      name_filter: "amzn2-ami-hvm-*-x86_64-gp2"
+    vpc_cidr: "10.10.0.0/16"
+    public_subnet_cidr: "10.10.1.0/24"
+    private_subnet_cidr: "10.10.2.0/24"
+    ssh_allowed_cidr: ""               # optional; if empty will be set to 0.0.0.0/0 (not secure)
+    inventory_file: "/root/three_tier_inventory.ini"
+    aws_tags:
+      Project: three-tier
+      Owner: "ansible"
+
+  tasks:
+    - name: Validate required vars
+      fail:
+        msg: "You must pass key_name via --extra-vars (the AWS key pair name)."
+      when: key_name == ""
+
+    - name: Determine control node public IP (for locking down SSH)
+      uri:
+        url: https://checkip.amazonaws.com
+        return_content: yes
+        status_code: 200
+      register: my_ip
+      ignore_errors: yes
+
+    - name: Set ssh_allowed_cidr default if not provided
+      set_fact:
+        ssh_allowed_cidr: "{{ (my_ip.content | default('')).strip() + '/32' if ssh_allowed_cidr == '' and (my_ip.content is defined) else (ssh_allowed_cidr | default('0.0.0.0/0')) }}"
+
+    - name: Find latest Amazon Linux 2 AMI
+      amazon.aws.ec2_ami_info:
+        owners: ['amazon']
+        filters:
+          name: "amzn2-ami-hvm-2.0.*-x86_64-gp2"
+        state: available
+      register: ami_info
+
+    - name: Select newest AMI id
+      set_fact:
+       ami_id: "{{ ami_info.images | sort(attribute='creation_date') | last | default({}) | dict2items | selectattr('key', 'equalto', 'image_id') | map(attribute='value') | first }}"
+
+
+    - name: Create VPC
+      amazon.aws.ec2_vpc_net:
+        name: three-tier-vpc
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ region }}"
+        tags: "{{ aws_tags }}"
+      register: vpc
+
+    - name: Create public subnet
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ public_subnet_cidr }}"
+        region: "{{ region }}"
+        az: "{{ region }}a"
+        map_public: yes
+        tags: "{{ aws_tags | combine({'Name':'three-tier-public-subnet'}) }}"
+      register: public_subnet
+
+    - name: Create private subnet
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ private_subnet_cidr }}"
+        region: "{{ region }}"
+        az: "{{ region }}a"
+        map_public: no
+        tags: "{{ aws_tags | combine({'Name':'three-tier-private-subnet'}) }}"
+      register: private_subnet
+
+    - name: Create Internet Gateway and attach to VPC
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        state: present
+        tags: "{{ aws_tags }}"
+      register: igw
+
+    - name: Create public route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        tags: "{{ aws_tags | combine({'Name':'three-tier-public-rt'}) }}"
+      register: pub_rt
+
+    - name: Associate public subnet with route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        route_table_id: "{{ pub_rt.route_table.id }}"
+        subnets:
+          - "{{ public_subnet.subnet.id }}"
+        state: present
+
+    - name: Create route to IGW for public route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        route_table_id: "{{ pub_rt.route_table.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+        state: present
+
+
+    - name: Create web security group (public)
+      amazon.aws.ec2_group:
+        name: three-tier-web-sg
+        description: Security group for web (http + ssh)
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ ssh_allowed_cidr }}"
+        tags: "{{ aws_tags }}"
+      register: web_sg
+
+    - name: Create app security group (private)
+      amazon.aws.ec2_group:
+        name: three-tier-app-sg
+        description: Security group for app (tomcat + ssh from admin)
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 8080
+            to_port: 8080
+            group_name: "{{ web_sg.group_name }}"
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ ssh_allowed_cidr }}"
+        tags: "{{ aws_tags }}"
+      register: app_sg
+
+    - name: Create db security group (if creating DB)
+      amazon.aws.ec2_group:
+        name: three-tier-db-sg
+        description: Security group for DB (mysql)
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            from_port: 3306
+            to_port: 3306
+            group_id: "{{ app_sg.group_id }}"
+        tags: "{{ aws_tags }}"
+      register: db_sg
+      when: create_db | bool
+
+    - name: Launch web EC2
+      amazon.aws.ec2_instance:
+        name: "web-server"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ web_instance_type }}"
+        image_id: "{{ latest_ami_id }}"
+        wait: yes
+        vpc_subnet_id: "{{ pub_subnet.subnet.id }}"
+        security_group: "{{ web_sg.group_id }}"
+        assign_public_ip: true
+        tags:
+          Role: "web"
+          Project: "three-tier"
+      register: web_ec2
+
+  #  - name: Launch web EC2
+  #    amazon.aws.ec2_instance:
+  #      name: three-tier-web
+  #      key_name: "{{ key_name }}"
+  #      image_id: "{{ ami_id }}"
+  #      instance_type: "{{ web_instance_type }}"
+  #      region: "{{ region }}"
+  #      vpc_subnet_id: "{{ public_subnet.subnet.id }}"
+  #      security_group: "{{ web_sg.group_name }}"
+  #      wait: true
+  #      tags: "{{ aws_tags | combine({'Role':'web'}) }}"
+  #    register: web_instance
+
+
+    - name: Launch app EC2
+      amazon.aws.ec2_instance:
+        name: three-tier-app
+        key_name: "{{ key_name }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ app_instance_type }}"
+        region: "{{ region }}"
+        vpc_subnet_id: "{{ private_subnet.subnet.id }}"
+        security_group: "{{ app_sg.group_name }}"
+        wait: true
+        tags: "{{ aws_tags | combine({'Role':'app'}) }}"
+      register: app_instance
+
+    - name: (Optional) Launch DB EC2 (if create_db true)
+      amazon.aws.ec2_instance:
+        name: three-tier-db
+        key_name: "{{ key_name }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ db_instance_type }}"
+        region: "{{ region }}"
+        vpc_subnet_id: "{{ private_subnet.subnet.id }}"
+        security_group: "{{ db_sg.group_name }}"
+        wait: true
+        tags: "{{ aws_tags | combine({'Role':'db'}) }}"
+      register: db_instance
+      when: create_db | bool
+
+    - name: Build inventory file - header
+      copy:
+        dest: "{{ inventory_file }}"
+        content: |
+          [web]
+          {{ web_instance.instances[0].public_ip_address }}
+
+          [app]
+          {{ app_instance.instances[0].private_ip_address }}
+
+          {% if create_db %}
+          [db]
+          {{ db_instance.instances[0].private_ip_address }}
+          {% endif %}
+
+    - name: Add web host to in-memory inventory
+      add_host:
+        name: "{{ web_instance.instances[0].public_ip_address }}"
+        groups: dynamic_web
+        ansible_host: "{{ web_instance.instances[0].public_ip_address }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "/root/.ssh/{{ key_name }}.pem"
+
+    - name: Add app host to in-memory inventory
+      add_host:
+        name: "{{ app_instance.instances[0].private_ip_address }}"
+        groups: dynamic_app
+        ansible_host: "{{ app_instance.instances[0].private_ip_address }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "/root/.ssh/{{ key_name }}.pem"
+
+    - name: Set db_private_ip fact (if create_db false, still allow user pass)
+      set_fact:
+        db_private_ip: >-
+          {{ (db_instance.instances[0].private_ip_address if (create_db | bool) else (db_private_ip | default(''))) }}
+      when: create_db | bool
+
+- name: Configure web server (httpd)
+  hosts: dynamic_web
+  gather_facts: yes
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+    - name: Wait for SSH on web
+      wait_for:
+        host: "{{ web_instance.instances[0].public_ip_address }}"
+        port: 22
+        timeout: 300
+
+    - name: Install httpd
+      yum:
+        name: httpd
+        state: present
+
+    - name: Ensure httpd enabled & started
+      service:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Deploy sample index
+      copy:
+        dest: /var/www/html/index.html
+        content: |
+          <html><body>
+          <h1>Web Tier on {{ inventory_hostname }}</h1>
+          <p>App IP: {{ hostvars['dynamic_app'] | default({}) }}</p>
+          </body></html>
+        owner: root
+        group: root
+        mode: '0644'
+
+- name: Configure app server (Tomcat)
+  hosts: dynamic_app
+  gather_facts: yes
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    tomcat_service_name: tomcat
+  tasks:
+    - name: Wait for SSH on app
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 300
+
+    - name: Install Java (OpenJDK)
+      yum:
+        name: java-11-amazon-corretto-headless
+        state: present
+      ignore_errors: yes
+
+    - name: Install tomcat
+      yum:
+        name: tomcat
+        state: present
+
+    - name: Ensure tomcat enabled & started
+      service:
+        name: "{{ tomcat_service_name }}"
+        state: started
+        enabled: yes
+
+    - name: Write DB connection info for app
+      copy:
+        dest: /etc/myapp/db_connection.conf
+        content: |
+          DB_HOST={{ db_private_ip | default('127.0.0.1') }}
+          DB_PORT=3306
+        owner: tomcat
+        group: tomcat
+        mode: '0644'
+      notify: restart tomcat
+
+  handlers:
+    - name: restart tomcat
+      service:
+        name: "{{ tomcat_service_name }}"
+        state: restarted
+

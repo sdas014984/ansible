@@ -1,0 +1,8 @@
+- hosts: localhost
+  tasks:
+    - name: Create an instance
+      amazon.aws.ec2_instance:
+        name: "dev-instance"
+        image_id: "ami-0bdd88bd06d16ba03"
+        instance_type: "t3.micro"
+
